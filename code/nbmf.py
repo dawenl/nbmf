@@ -9,16 +9,20 @@ CREATED: 2014-11-18 20:50:49 by Dawen Liang <dliang@ee.columbia.edu>
 
 import sys
 import numpy as np
-from scipy import special
+from scipy import sparse, special
 
 from math import log
 from sklearn.base import BaseEstimator, TransformerMixin
 
 
+DEFAULT_NUM_ITER = 1
+EPS = np.spacing(1)
+
+
 class NegBinomMF(BaseEstimator, TransformerMixin):
     ''' Negative-binomial matrix factorization with batch inference '''
-    def __init__(self, n_components=100, max_iter=100, tol=0.0005,
-                 smoothness=100, random_state=None, verbose=False,
+    def __init__(self, n_components=100, max_iter=100, max_inner_iter=20,
+                 tol=0.0005, smoothness=100, random_state=None, verbose=False,
                  **kwargs):
         ''' Negative-binomial matrix factorization
         Arguments
@@ -42,6 +46,7 @@ class NegBinomMF(BaseEstimator, TransformerMixin):
 
         self.n_components = n_components
         self.max_iter = max_iter
+        self.max_inner_iter = max_inner_iter
         self.tol = tol
         self.smoothness = smoothness
         self.random_state = random_state
@@ -66,15 +71,13 @@ class NegBinomMF(BaseEstimator, TransformerMixin):
         # variational parameters for lambda
         self.nu_lam = self.smoothness * np.random.gamma(self.smoothness,
                                                         1. / self.smoothness,
-                                                        size=X.shape
-                                                        ).astype(np.float32)
-        self.rho_lam = 1. / X * self.smoothness * \
-            np.random.gamma(self.smoothness, 1. / self.smoothness, size=X.shape
-                            ).astype(np.float32)
-        #self.rho_lam = self.smoothness * np.random.gamma(self.smoothness,
-        #                                                 1. / self.smoothness,
-        #                                                 size=X.shape
-        #                                                 ).astype(np.float32)
+                                                        size=X.shape)
+        #self.rho_lam = 1. / (X + EPS) * self.smoothness * \
+        #    np.random.gamma(self.smoothness, 1. / self.smoothness,
+        #                    size=X.shape)
+        self.rho_lam = self.smoothness * np.random.gamma(self.smoothness,
+                                                         1. / self.smoothness,
+                                                         size=X.shape)
         self.Elam, self.Eloglam = comp_gamma_expectations(self.nu_lam,
                                                           self.rho_lam)
 
@@ -82,12 +85,10 @@ class NegBinomMF(BaseEstimator, TransformerMixin):
         # variational parameters for theta
         self.rho_t = 10000 * np.random.gamma(self.smoothness,
                                              1. / self.smoothness,
-                                             size=(self.n_components, n_users)
-                                             ).astype(np.float32)
+                                             size=(self.n_components, n_users))
         self.tau_t = 10000 * np.random.gamma(self.smoothness,
                                              1. / self.smoothness,
-                                             size=(self.n_components, n_users)
-                                             ).astype(np.float32)
+                                             size=(self.n_components, n_users))
         self.Et, self.Etinv = comp_gig_expectations(self.a,
                                                     self.rho_t,
                                                     self.tau_t)
@@ -95,15 +96,12 @@ class NegBinomMF(BaseEstimator, TransformerMixin):
 
     def _init_items(self, n_items):
         # variational parameters for beta
-
         self.rho_b = 10000 * np.random.gamma(self.smoothness,
                                              1. / self.smoothness,
-                                             size=(n_items, self.n_components)
-                                             ).astype(np.float32)
+                                             size=(n_items, self.n_components))
         self.tau_b = 10000 * np.random.gamma(self.smoothness,
                                              1. / self.smoothness,
-                                             size=(n_items, self.n_components)
-                                             ).astype(np.float32)
+                                             size=(n_items, self.n_components))
         self.Eb, self.Ebinv = comp_gig_expectations(self.c,
                                                     self.rho_b,
                                                     self.tau_b)
@@ -113,7 +111,7 @@ class NegBinomMF(BaseEstimator, TransformerMixin):
         '''Fit the model to the data in X.
         Parameters
         ----------
-        X : array-like, shape (n_samples, n_feats)
+        X : array-like, shape (n_items, n_users)
             Training data.
         Returns
         -------
@@ -127,55 +125,61 @@ class NegBinomMF(BaseEstimator, TransformerMixin):
         self._update(X)
         return self
 
-    #def transform(self, X, attr=None):
-    #    '''Encode the data as a linear combination of the latent components.
-    #    Parameters
-    #    ----------
-    #    X : array-like, shape (n_samples, n_feats)
-    #    attr: string
-    #        The name of attribute, default 'Eb'. Can be changed to Elogb to
-    #        obtain E_q[log beta] as transformed data.
-    #    Returns
-    #    -------
-    #    X_new : array-like, shape(n_samples, n_filters)
-    #        Transformed data, as specified by attr.
-    #    '''
-    #
-    #    if not hasattr(self, 'Eb'):
-    #        raise ValueError('There are no pre-trained components.')
-    #    n_samples, n_feats = X.shape
-    #    if n_feats != self.Eb.shape[1]:
-    #        raise ValueError('The dimension of the transformed data '
-    #                         'does not match with the existing components.')
-    #    if attr is None:
-    #        attr = 'Et'
-    #    self._init_weights(n_samples)
-    #    self._update(X, update_beta=False)
-    #    return getattr(self, attr)
+    def transform(self, X, idx=None, attr=None):
+        # sanity check
+        if not hasattr(self, 'Et'):
+            raise ValueError('There are no pre-trained user latent factors.')
+        n_items, n_users = X.shape
+        if n_users != self.Et.shape[1]:
+            raise ValueError('The dimension of the transformed data '
+                             'does not match with the existing factors.')
+        if attr is None:
+            attr = 'Eb'
 
-    def _update(self, X):
-        # alternating between update users and items
+        if sparse.isspmatrix(X):
+            X = X.toarray()
+        self._init_aux(X)
+        if idx is None:
+            self._init_items(n_items)
+        self._update(X, update_users=False, idx=idx)
+        return getattr(self, attr)
+
+    def _update(self, X, update_users=True, idx=None):
+        # alternating between updating users and items
         old_bd = -np.inf
         for i in xrange(self.max_iter):
-            for _ in xrange(10):
-                self._update_users(X)
-                self._update_items(X)
-            self._update_aux(X)
-            bound = self._bound(X)
+            old_inner_bd = -np.inf
+            for j in xrange(self.max_inner_iter):
+                if update_users:
+                    self._update_users()
+                self._update_items(idx=idx)
+                inner_bound = self._bound(X, aux_updated=False, idx=idx)
+                improvement = (inner_bound - old_inner_bd) / abs(old_inner_bd)
+                if self.verbose:
+                    sys.stdout.write('\r\tInner TERATION: %d\tObjective: %.2f'
+                                     '\tOld objective: %.2f\t'
+                                     'Improvement: %.5f' % (j, inner_bound,
+                                                            old_inner_bd,
+                                                            improvement))
+                    sys.stdout.flush()
+                old_inner_bd = inner_bound
+            if self.verbose:
+                sys.stdout.write('\n')
+
+            self._update_aux(X, idx=idx)
+            bound = self._bound(X, idx=idx)
             improvement = (bound - old_bd) / abs(old_bd)
             if self.verbose:
                 print('ITERATION: %d\tObjective: %.2f\t'
                       'Old objective: %.2f\t'
                       'Improvement: %.5f' % (i, bound, old_bd, improvement))
                 sys.stdout.flush()
-            #if improvement < self.tol:
-            #    break
+            if improvement < self.tol and improvement > 10:
+                break
             old_bd = bound
-        #if self.verbose:
-        #    sys.stdout.write('\n')
         pass
 
-    def _update_users(self, X):
+    def _update_users(self):
         EXinv = 1. / self.Eb.dot(self.Et)
         laminvXsq = self.Elam / (self.Ebinvinv.dot(self.Etinvinv))**2
         self.rho_t = self.b + self.r * self.Eb.T.dot(EXinv)
@@ -186,38 +190,53 @@ class NegBinomMF(BaseEstimator, TransformerMixin):
                                                     self.tau_t)
         self.Etinvinv = 1. / self.Etinv
 
-    def _update_items(self, X):
-        EXinv = 1. / self.Eb.dot(self.Et)
-        laminvXsq = self.Elam / (self.Ebinvinv.dot(self.Etinvinv))**2
-        self.rho_b = self.d + self.r * EXinv.dot(self.Et.T)
-        self.tau_b = self.r * self.Ebinvinv**2 * laminvXsq.dot(self.Etinvinv.T)
-        self.tau_b[self.tau_b < 1e-100] = 0
-        self.Eb, self.Ebinv = comp_gig_expectations(self.c,
-                                                    self.rho_b,
-                                                    self.tau_b)
-        self.Ebinvinv = 1. / self.Ebinv
+    def _update_items(self, idx=None):
+        if idx is None:
+            idx = slice(None, None)
+        EXinv = 1. / self.Eb[idx].dot(self.Et)
+        laminvXsq = self.Elam / (self.Ebinvinv[idx].dot(self.Etinvinv))**2
+        rho_b = self.d + self.r * EXinv.dot(self.Et.T)
+        tau_b = self.r * self.Ebinvinv[idx]**2 * laminvXsq.dot(self.Etinvinv.T)
+        tau_b[tau_b < 1e-100] = 0
+        self.rho_b[idx], self.tau_b[idx] = rho_b, tau_b
+        self.Eb[idx], self.Ebinv[idx] = comp_gig_expectations(self.c,
+                                                              rho_b,
+                                                              tau_b)
+        self.Ebinvinv[idx] = 1. / self.Ebinv[idx]
 
-    def _update_aux(self, X):
+    def _update_aux(self, X, idx=None):
+        if idx is None:
+            idx = slice(None, None)
         self.nu_lam = self.r + X
-        self.rho_lam = 1 + self.r / self.Ebinvinv.dot(self.Etinvinv)
+        self.rho_lam = 1 + self.r / self.Ebinvinv[idx].dot(self.Etinvinv)
         self.Elam, self.Eloglam = comp_gamma_expectations(self.nu_lam,
                                                           self.rho_lam)
 
-    def _bound(self, X):
+    def _bound(self, X, aux_updated=True, idx=None):
+        if idx is None:
+            idx = slice(None, None)
+        # E_q [log p(y, lambda | theta, beta) - log q(lambda)]
         bound = np.sum(special.gammaln(self.nu_lam) -
                        self.nu_lam * np.log(self.rho_lam))
-        bound -= self.r * (np.log(self.Eb.dot(self.Et))).sum()
+        bound -= self.r * (np.log(self.Eb[idx].dot(self.Et))).sum()
+        if not aux_updated:
+            # if we don't update aux, then this term is not equal 0
+            bound += np.sum((self.rho_lam - self.r /
+                             self.Ebinvinv[idx].dot(self.Etinvinv) - 1)
+                            * self.Elam)
+        # E_q [log p(theta) - log q(theta)]
         bound += gig_gamma_term(self.Et, self.Etinv, self.rho_t, self.tau_t,
                                 self.a, self.b)
-        bound += gig_gamma_term(self.Eb, self.Ebinv, self.rho_b, self.tau_b,
-                                self.c, self.d)
+        # E_q [log p(beta) - log q(beta)]
+        bound += gig_gamma_term(self.Eb[idx], self.Ebinv[idx], self.rho_b[idx],
+                                self.tau_b[idx], self.c, self.d)
         return bound
 
 
 class OnlineNegBinomMF(NegBinomMF):
     ''' Negtive-binomial matrix factorization with stochastic inference '''
     def __init__(self, n_components=100, batch_size=10, n_pass=10,
-                 max_iter=100, tol=0.0005, shuffle=True, smoothness=100,
+                 max_inner_iter=20, tol=0.0005, shuffle=True, smoothness=100,
                  random_state=None, verbose=False,
                  **kwargs):
         ''' Negative-binomial matrix factorization
@@ -249,7 +268,8 @@ class OnlineNegBinomMF(NegBinomMF):
         self.n_components = n_components
         self.batch_size = batch_size
         self.n_pass = n_pass
-        self.max_iter = max_iter
+        self.max_iter = DEFAULT_NUM_ITER
+        self.max_inner_iter = max_inner_iter
         self.tol = tol
         self.shuffle = shuffle
         self.smoothness = smoothness
@@ -266,14 +286,19 @@ class OnlineNegBinomMF(NegBinomMF):
     def _parse_args(self, **kwargs):
         self.a = float(kwargs.get('a', 0.1))
         self.b = float(kwargs.get('b', 0.1))
+        self.c = float(kwargs.get('c', 0.1))
+        self.d = float(kwargs.get('d', 0.1))
+
+        self.r = float(kwargs.get('r', 2.0))
+
         self.t0 = float(kwargs.get('t0', 1.))
-        self.kappa = float(kwargs.get('kappa', 0.6))
+        self.kappa = float(kwargs.get('kappa', 0.5))
 
     def fit(self, X, est_total=None):
-        '''Fit the model to the data in X. X has to be loaded into memory.
+        '''Fit the model to the data in X. X can be a scipy.sparse.csr_matrix
         Parameters
         ----------
-        X : array-like, shape (n_samples, n_feats)
+        X : array-like, shape (n_items, n_users)
             Training data.
         est_total : int
             The estimated size of the entire data. Could be larger than the
@@ -283,34 +308,34 @@ class OnlineNegBinomMF(NegBinomMF):
         self: object
             Returns the instance itself.
         '''
-        n_samples, n_feats = X.shape
+        n_items, n_users = X.shape
         if est_total is None:
-            self._scale = float(n_samples) / self.batch_size
+            self._scale = float(n_items) / self.batch_size
         else:
             self._scale = float(est_total) / self.batch_size
-        self._init_components(n_feats)
+
+        self._init_items(n_items)
+        self._init_users(n_users)
+
         self.bound = list()
         for count in xrange(self.n_pass):
             if self.verbose:
                 print 'Iteration %d: passing through the data...' % count
-            indices = np.arange(n_samples)
+            indices = np.arange(n_items)
             if self.shuffle:
                 np.random.shuffle(indices)
-            X_shuffled = X[indices]
-            for (i, istart) in enumerate(xrange(0, n_samples,
-                                                self.batch_size), 1):
+            for (i, istart) in enumerate(xrange(0, n_items, self.batch_size)):
                 print '\tMinibatch %d:' % i
-                iend = min(istart + self.batch_size, n_samples)
-                self.set_learning_rate(iter=i)
-                mini_batch = X_shuffled[istart: iend]
-                self.partial_fit(mini_batch)
-                self.bound.append(self._stoch_bound(mini_batch))
+                idx = indices[istart: istart + self.batch_size]
+                mini_batch = X[idx]
+                self.set_learning_rate(mini_batch, iter=i)
+                self.partial_fit(mini_batch, idx=idx)
+                self.bound.append(self._stoch_bound(mini_batch, idx=idx))
         return self
 
-    def partial_fit(self, X):
+    def partial_fit(self, X, idx=None):
         '''Fit the data in X as a mini-batch and update the parameter by taking
-        a natural gradient step. Could be invoked from a high-level out-of-core
-        wrapper.
+        a natural gradient step.
         Parameters
         ----------
         X : array-like, shape (batch_size, n_feats)
@@ -320,18 +345,23 @@ class OnlineNegBinomMF(NegBinomMF):
         self: object
             Returns the instance itself.
         '''
-        self.transform(X)
+        self.transform(X, idx=idx)
         # take a (natural) gradient step
-        ratio = X / self._xexplog()
-        self.gamma_b = (1 - self.rho) * self.gamma_b + self.rho * \
-            (self.b + self._scale * np.exp(self.Elogb) *
-             np.dot(np.exp(self.Elogt).T, ratio))
-        self.rho_b = (1 - self.rho) * self.rho_b + self.rho * \
-            (self.b + self._scale * np.sum(self.Et, axis=0, keepdims=True).T)
-        self.Eb, self.Elogb = comp_gamma_expectations(self.gamma_b, self.rho_b)
+        EXinv = 1. / self.Eb[idx].dot(self.Et)
+        laminvXsq = self.Elam / (self.Ebinvinv[idx].dot(self.Etinvinv))**2
+        self.rho_t = (1 - self.rho) * self.rho_t + self.rho * \
+            (self.b + self._scale * self.r * self.Eb[idx].T.dot(EXinv))
+        self.tau_t = (1 - self.rho) * self.tau_t + self.rho * \
+            self._scale * self.r * self.Etinvinv**2 * \
+            self.Ebinvinv[idx].T.dot(laminvXsq)
+        self.tau_t[self.tau_t < 1e-100] = 0
+
+        self.Et, self.Etinv = comp_gig_expectations(self.a,
+                                                    self.rho_t,
+                                                    self.tau_t)
         return self
 
-    def set_learning_rate(self, iter=None, rho=None):
+    def set_learning_rate(self, X, iter=None, rho=None):
         '''Set the learning rate for the gradient step
         Parameters
         ----------
@@ -346,34 +376,37 @@ class OnlineNegBinomMF(NegBinomMF):
         self: object
             Returns the instance itself.
         '''
+        #TODO per-user learning rate
         if rho is not None:
             self.rho = rho
         elif iter is not None:
             self.rho = (iter + self.t0)**(-self.kappa)
         else:
             raise ValueError('invalid learning rate.')
+        print '\t\tLearning rate = %.3f' % self.rho
         return self
 
-    def _stoch_bound(self, X):
-        bound = np.sum(X * np.log(self._xexplog()) - self.Et.dot(self.Eb))
-        bound += gamma_term(self.a, self.a * self.c, self.gamma_t, self.rho_t,
-                             self.Et, self.Elogt)
-        bound += self.n_components * X.shape[0] * self.a * np.log(self.c)
+    def _stoch_bound(self, X, idx=None):
+        if idx is None:
+            idx = slice(None, None)
+        # E_q [log p(y, lambda | theta, beta) - log q(lambda)]
+        bound = np.sum(special.gammaln(self.nu_lam) -
+                       self.nu_lam * np.log(self.rho_lam))
+        bound -= self.r * (np.log(self.Eb[idx].dot(self.Et))).sum()
+        # E_q [log p(beta) - log q(beta)]
+        bound += gig_gamma_term(self.Eb[idx], self.Ebinv[idx], self.rho_b[idx],
+                                self.tau_b[idx], self.c, self.d)
+        # scale the objective to "pretent" we have the full dataset
         bound *= self._scale
-        bound += gamma_term(self.b, self.b, self.gamma_b, self.rho_b,
-                             self.Eb, self.Elogb)
+        # E_q [log p(theta) - log q(theta)]
+        bound += gig_gamma_term(self.Et, self.Etinv, self.rho_t, self.tau_t,
+                                self.a, self.b)
+
         return bound
 
 
 def comp_gamma_expectations(alpha, beta):
     return (alpha / beta, special.psi(alpha) - np.log(beta))
-
-
-def comp_gamma_entropy(alpha, beta):
-    ''' Compute the entropy of a r.v. theta ~ Gamma(alpha, beta)
-    '''
-    return (alpha - np.log(beta) + special.gammaln(alpha) +
-            (1 - alpha) * special.psi(alpha))
 
 
 def comp_gig_expectations(alpha, beta, gamma):
@@ -412,14 +445,6 @@ def comp_gig_expectations(alpha, beta, gamma):
     Exinv[Exinv < 0] = np.inf
 
     return (Ex, Exinv)
-
-
-def gamma_term(Ex, Elogx, shape, rate, a, b):
-    ''' Compute E_q[log p(x)] - E_q[log q(x)] where:
-        p(x) = Gamma(a, b), q(x) = Gamma(shape, rate)
-    '''
-    return np.sum((a - shape) * Elogx - (b - rate) * Ex +
-                  (special.gammaln(shape) - shape * np.log(rate)))
 
 
 def gig_gamma_term(Ex, Exinv, rho, tau, a, b):
