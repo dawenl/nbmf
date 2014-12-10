@@ -356,9 +356,7 @@ class OnlineNegBinomMF(NegBinomMF):
             (self.a + self._scale * np.exp(self.Elogt) * np.exp(self.Elogb[idx].T).dot(ratio))
         self.rho_t = (1 - self.rho) * self.rho_t + self.rho * \
             (self.b + self._scale * self.Eb[idx].T.dot(self.Elam))
-        old_Et = self.Et.copy()
         self.Et, self.Elogt = comp_gamma_expectations(self.nu_t, self.rho_t)
-        print '\tEt relative change: %.3f' % np.sqrt(np.sum((self.Et - old_Et)**2))
         return self
 
     def set_learning_rate(self, X, iter=None, rho=None):
@@ -383,7 +381,6 @@ class OnlineNegBinomMF(NegBinomMF):
             self.rho = (iter + self.t0)**(-self.kappa)
         else:
             raise ValueError('invalid learning rate.')
-        print '\t\tLearning rate = %.3f' % self.rho
         return self
 
     def _stoch_bound(self, X, idx=None):
